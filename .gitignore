@@ -1,0 +1,13 @@
+.DS_Store
+.codex/
+__pycache__/
+logs/
+resumes/*.pdf
+*.env
+.env*
+tmp/
+.state/
+reports/
+.venv*/
+models/
+logs/launchd*.log

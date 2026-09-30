@@ -1,0 +1,15 @@
+# Personal career notes stay local. Keep only the vault instructions and generic
+# templates under version control unless the user explicitly chooses otherwise.
+.obsidian/
+01 Profile/*
+02 Experience/*
+03 Projects/*
+04 Skills/*
+05 Evidence/*
+06 Stories/*
+99 Archive/*
+07 Applications/01 Active/*
+!07 Applications/01 Active/.gitkeep
+07 Applications/99 Archive/*
+!07 Applications/99 Archive/.gitkeep
+!.gitkeep

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "checked_on": "2026-09-27",
+  "source": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+  "scope": "Standard API token rates. This is an estimate for Codex batch usage and excludes third-party job-source fees, local embedding compute, and any charges not exposed in Codex usage events.",
+  "models": {
+    "gpt-5.6-luna": {
+      "input_usd_per_million_tokens": 0.2,
+      "cached_input_usd_per_million_tokens": 0.02,
+      "output_usd_per_million_tokens": 1.2
+    }
+  }
+}

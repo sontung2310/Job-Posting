@@ -1,0 +1,65 @@
+# Public source registry used by scripts/job_sources.py.
+# Keep credentials in .env; do not put secrets in this file.
+
+browser:
+  headless: true
+  max_concurrency: 2
+  timeout_seconds: 45
+
+sources:
+  greenhouse:
+    enabled: true
+    boards:
+      - name: Culture Amp
+        api: https://boards-api.greenhouse.io/v1/boards/cultureamp/jobs
+
+  ashby:
+    enabled: true
+    boards:
+      - name: Airwallex
+        api: https://api.ashbyhq.com/posting-api/job-board/airwallex?includeCompensation=true
+
+  lever:
+    enabled: true
+    boards:
+      - name: Immutable
+        api: https://api.lever.co/v0/postings/immutable?mode=json
+
+  workday:
+    enabled: true
+    boards:
+      - name: Reserve Bank of Australia
+        careers_url: https://rba.wd105.myworkdayjobs.com/en-US/RBA_Careers
+        api: https://rba.wd105.myworkdayjobs.com/wday/cxs/rba/RBA_Careers/jobs
+
+  smartrecruiters:
+    enabled: true
+    boards:
+      - name: Wise
+        company_id: wise
+
+  aps_jobs:
+    enabled: true
+    search_url: https://www.apsjobs.gov.au/s/job-search
+    query_param: searchString
+
+  state_portals:
+    enabled: true
+    portals:
+      - id: victoria
+        name: Victoria Government Careers
+        state: VIC
+        search_url: https://www.careers.vic.gov.au/jobs
+        query_param: keywords
+      - id: new_south_wales
+        name: NSW Government Careers
+        state: NSW
+        search_url: https://iworkfor.nsw.gov.au/jobs/nsw-rfs/all-agencies/all-organisations--entities/all-categories/all-locations/all-worktypes
+      - id: western_australia
+        name: WA Government Jobs
+        state: WA
+        search_url: https://search.jobs.wa.gov.au/jobs/search
+      - id: south_australia
+        name: I Work For SA
+        state: SA
+        search_url: https://www.iworkfor.sa.gov.au/

@@ -1,0 +1,9 @@
+# Local-only semantic retrieval for scripts/vault_evidence.py.
+# The first model download fetches model assets only; the private vault is never uploaded.
+# The encoder is implemented directly so startup does not import the optional
+# sentence-transformers training stack, Transformers auto-loader, or scikit-learn.
+tokenizers>=0.19
+safetensors>=0.4
+huggingface-hub>=0.24
+torch>=2.2
+numpy>=1.24
