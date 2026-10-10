@@ -16,6 +16,10 @@ logs/launchd*.log
 # as the only versioned dotfile in the repository.
 .*
 !/.gitignore
+!/.agents/
+!/.agents/**
+.agents/**/__pycache__/
+.agents/**/*.py[cod]
 
 # Local agent instructions and machine-specific rules.
 AGENTS.md

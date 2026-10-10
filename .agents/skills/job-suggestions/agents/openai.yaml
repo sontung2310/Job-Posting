@@ -1,0 +1,4 @@
+interface:
+  display_name: "Job Suggestions"
+  short_description: "Evidence-grounded suggestions for selected jobs"
+  default_prompt: "Use $job-suggestions to prepare suggestions for the jobs I selected from the current scoring report."
