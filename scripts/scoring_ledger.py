@@ -226,8 +226,8 @@ def run_record(
 ) -> int:
     if not 0 <= score <= 100:
         raise ValueError("score must be between 0 and 100")
-    if status not in {"qualified", "below_threshold", "ineligible"}:
-        raise ValueError("status must be qualified, below_threshold, or ineligible")
+    if status not in {"qualified", "below_threshold"}:
+        raise ValueError("status must be qualified or below_threshold")
     if not job_url.strip():
         raise ValueError("a canonical job URL is required")
 
@@ -322,7 +322,10 @@ def load_rates(path: Path, model: str) -> tuple[dict[str, float], dict[str, Any]
 def estimate_cost(usage: dict[str, int], rates: dict[str, float]) -> tuple[float, int, int]:
     cached = min(usage["cached_input_tokens"], usage["input_tokens"])
     uncached = usage["input_tokens"] - cached
-    billable_output = usage["output_tokens"] + usage["reasoning_output_tokens"]
+    if usage["reasoning_output_tokens"] > usage["output_tokens"]:
+        raise ValueError("reasoning output tokens cannot exceed total output tokens")
+    # Reasoning tokens are already included in output_tokens.
+    billable_output = usage["output_tokens"]
     estimated_cost = (
         uncached * rates["input_usd_per_million_tokens"]
         + cached * rates["cached_input_usd_per_million_tokens"]

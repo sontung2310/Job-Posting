@@ -1,311 +1,227 @@
-# Job Search Automation
+# Job Search
 
-This repository finds recent jobs, filters them against configured titles and
-locations, scores them against verified career evidence, and prepares an
-approval report. It does not apply for jobs, contact employers, or modify a
-resume.
+The job-search router coordinates three stage skills:
 
-There are two ways to use it:
+- **job-retrieval** discovers configured jobs and returns private jobs/coverage.
+- **job-scoring** assesses saved jobs and ends at the ranked scoring report.
+- **job-suggestions** generates detailed suggestions only for human-selected jobs.
 
-- **Source verification:** fetch and validate the additional ATS and Australian
-  government sources with scripts/job_sources.py.
-- **Full pipeline:** run the Codex workflow across Indeed, LinkedIn, Seek, the
-  additional sources, evidence scoring, resume coverage, and optional private
-  Obsidian/Notion writes.
+A requested full job search (“get fresh jobs”, for example) runs discovery →
+conditions and evidence scoring → a ranked numbered report → your selection →
+selected-job suggestions → approved destination writes.
+Ordinary conversation does not execute the pipeline. Explicit retrieval-only,
+skill-only and saved-job scoring requests retain their requested scope.
+`AGENTS.md` owns routing and shared protections; each skill owns its stage.
+Reference documents provide definitions and connector facts.
 
-## 1. Prerequisites
+## Workflow overview
 
-For source verification:
+![Job-search workflow](docs/images/job-search-workflow.png)
 
-- macOS or Linux
-- Python 3.12
-- Git
-- Chromium, installed by Playwright during setup
+The workflow produces recommendations and, after separate approval, application
+records. It never submits applications or contacts employers.
 
-For the full pipeline, also install:
+## Setup and invocation
 
-- the Codex CLI
-- pdftotext from Poppler
-- the configured Indeed plugin
-- Apify MCP access for LinkedIn and Seek
-- an authenticated Notion connector if Notion writes are enabled
+### Requirements
 
-On macOS, install Poppler with Homebrew:
+- macOS or Linux. On Windows, use WSL2; the launcher uses Bash and POSIX file
+  locking.
+- Python 3.10 or newer and Git.
+- For terminal runs, install and sign in to the
+  [Codex CLI](https://developers.openai.com/codex/cli/). The launcher looks for
+  it at `/opt/homebrew/bin/codex` by default; set `CODEX_BIN` if it is elsewhere.
+- Poppler's `pdftotext` for scoring nonempty job lists. Retrieval-only runs do
+  not need PDF tools.
+- For fresh discovery, configure the Indeed connector and Apify MCP tools in
+  the Codex environment. The [source reference](.agents/skills/job-retrieval/references/sources.md)
+  lists the expected providers and current actor details.
 
-~~~
-brew install poppler
-~~~
+### Install the local dependencies
 
-## 2. Install the project
+Clone the repository, replace the placeholder with its Git URL, and enter the
+checkout:
 
-Clone the repository and create the project virtual environment:
-
-~~~
+```bash
 git clone <repository-url>
-cd <repository-directory>
-python3.12 -m venv .venv
+cd Job-Search
+```
+
+Then install from the repository root:
+
+```bash
+python3 -m venv .venv
 ./.venv/bin/python -m pip install --upgrade pip
-~~~
+./.venv/bin/python -m pip install -r requirements.txt
+mkdir -p resumes
+```
 
-Install the source runtime:
+Install Poppler if it is not already available:
 
-~~~
-./.venv/bin/python -m pip install -r requirements-sources.txt
-./.venv/bin/python -m playwright install chromium
-~~~
+```bash
+# macOS
+brew install poppler
 
-The full pipeline also needs local semantic retrieval:
+# Debian, Ubuntu, or WSL2
+sudo apt-get update
+sudo apt-get install poppler-utils
+```
 
-~~~
-./.venv/bin/python -m pip install -r requirements-semantic.txt
-~~~
+If `pdftotext` is outside `PATH`, set `PDFTOTEXT_BIN` to its full path before
+running the launcher.
 
-Run the tests after installation:
+### Add your own career data and provider settings
 
-~~~
-./.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
-~~~
+1. Add your career history, target roles, work authorization and evidence to
+   `career-vault/`. Start with the templates in `career-vault/00 System/Templates/`
+   and follow [the vault rules](career-vault/AGENTS.md). Only verified,
+   source-linked notes are used as evidence.
+2. Put at least two text-extractable PDF resumes in `resumes/` for scoring.
+   This directory is local input; the PDFs are ignored by Git.
+3. Set the roles, locations, enabled providers and `hybrid_search` option in
+   `config/search_targets.yaml`.
+4. Create a private `.env` file in the repository root for credentials. Set
+   `APIFY_TOKEN` when LinkedIn or Seek is enabled. When `hybrid_search: true`,
+   install the optional packages and provide `OPENAI_API_KEY` and
+   `CHROMA_API_KEY`; set `CHROMA_TENANT` and `CHROMA_DATABASE` if your Chroma
+   Cloud account requires them:
 
-## 3. Add your personal inputs
+   ```bash
+   ./.venv/bin/python -m pip install -r requirements-semantic.txt
+   ```
 
-The full pipeline expects at least two text-extractable PDF resumes in:
+   Hybrid search sends eligible verified evidence sections and job requirement
+   text to OpenAI for embeddings, then stores vectors and citation metadata in
+   Chroma Cloud. Read [the vault rules](career-vault/AGENTS.md) before enabling
+   it. Set `hybrid_search: false` to use local keyword matching without OpenAI
+   or Chroma credentials. `.env` is ignored by Git; never commit credentials.
 
-~~~
-resumes/*.pdf
-~~~
+This repository contains private career-vault notes, and Git tracks files under
+`career-vault/`. Do not publish this checkout or its history publicly. To create
+a public template, start from a sanitized copy with a fresh Git history and
+review all files before committing. `.env`, resume PDFs, `.state/`, `reports/`
+and `logs/` are ignored, but `career-vault/` is not.
 
-scripts/run.sh discovers the PDF files automatically and checks each one.
-Resume PDFs are Git-ignored; never commit them.
+### Check and run
 
-Replace or populate career-vault/ with your own verified evidence. Read
-career-vault/AGENTS.md before editing it. Evidence must be source-linked and
-verified before it can affect scoring.
+The default readiness check prepares scoring inputs, including the resume PDFs
+and `pdftotext`. To check discovery readiness instead, add
+`--retrieval-only --check`.
 
-Resume PDFs must contain selectable text. Check them with:
-
-~~~
-for resume in resumes/*.pdf; do
-  pdftotext "$resume" - | head
-done
-~~~
-
-## 4. Configure job searches
-
-Edit config/search_targets.yaml. A search is a title/location pair:
-
-~~~yaml
-timezone: "Australia/Melbourne"
-lookback_hours: 24
-
-searches:
-  - title: "AI Engineer"
-    location: "Melbourne"
-  - title: "Machine Learning Engineer"
-    location: "Sydney"
-~~~
-
-Production discovery only accepts jobs posted in the previous 24 hours. The
-source verifier uses --days 7 by default so that a new adapter can be tested
-against a larger recent window.
-
-For additional sources, a job matches only when:
-
-1. the source provides a reliable posting date within the requested window;
-2. every meaningful word in the configured title occurs in the job title; and
-3. the configured location appears in the source location.
-
-A zero-match result is valid. The pipeline does not broaden searches just to
-manufacture results.
-
-## 5. Configure additional sources
-
-Edit config/source_boards.yaml. Keep this file limited to public endpoints;
-do not put credentials in it.
-
-| Source | Configuration |
-| --- | --- |
-| Greenhouse | Add each employer's public board API URL under boards. |
-| Ashby | Add the employer's public posting API URL under boards. |
-| Lever | Add the employer's public postings API URL under boards. |
-| Workday | Add the employer's verified public tenant/CXS jobs URL and API URL. |
-| SmartRecruiters | Add the employer's public company_id. |
-| APS Jobs | Uses the configured APS search page and Playwright. |
-| State portals | Add or update portal URLs under state_portals. |
-
-The current Australian state adapters are Victoria, New South Wales, Western
-Australia, and South Australia. Some government portals use bot protection or
-change their frontend without notice. The adapter fails closed when it cannot
-verify a result page; it must not emit guessed jobs.
-
-## 6. Configure credentials and connectors
-
-Create a Git-ignored .env file for the full pipeline:
-
-~~~dotenv
-APIFY_TOKEN=your_apify_token
-NOTION_DATABASE_ID=your_notion_database_id
-~~~
-
-Restrict its permissions:
-
-~~~
-chmod 600 .env
-~~~
-
-APIFY_TOKEN is required by scripts/run.sh for the LinkedIn and Seek Actors.
-NOTION_DATABASE_ID is required only when Notion writes are enabled.
-
-The local .codex/config.toml points to the Apify launcher using an absolute
-path. This machine-specific file is not part of the reusable source commit.
-On another computer, create or update it so the command points to that
-computer's absolute path for scripts/start-apify-mcp.sh, then restart Codex.
-
-The full pipeline also requires:
-
-- Indeed plugin authentication;
-- the configured Apify MCP server and Actors;
-- the local ResumeSkills listed in docs/03-suggestions.md; and
-- a Notion connector with access to the configured database when enabled.
-
-Use the Indeed plugin for Indeed and the configured Apify Actors for LinkedIn
-and Seek. Do not replace those integrations with generic web search.
-
-## 7. Verify the additional sources
-
-Run every enabled additional source over the seven-day verification window:
-
-~~~
-./.venv/bin/python scripts/job_sources.py --days 7
-~~~
-
-Run selected sources while developing an adapter:
-
-~~~
-./.venv/bin/python scripts/job_sources.py \
-  --sources greenhouse aps_jobs state_portals \
-  --days 7
-~~~
-
-The command prints JSON containing fetched, recent, and
-keyword_location_matches counts for each source. A successful source with no
-current matching job reports zero matches. An inaccessible or unparseable
-source reports an error instead of returning unverifiable data.
-
-The source layer is implemented in scripts/job_sources.py and documented in
-docs/06-source-adapters.md. It uses direct HTTP for public structured feeds
-and bounded Playwright workers for rendered portals. Playwright source runs
-require network access and an installed Chromium browser.
-
-## 8. Run the full preflight
-
-Before a full discovery run, check the local evidence, resumes, semantic model,
-cost configuration, and required files:
-
-~~~
+```bash
 ./scripts/run.sh --check
-~~~
-
-The first semantic search downloads the local MiniLM model. Allow that download
-once if needed:
-
-~~~
-./.venv/bin/python scripts/vault_evidence.py search \
-  --requirement "Build and operate retrieval-augmented generation systems" \
-  --term "RAG" \
-  --allow-model-download
-~~~
-
-The model and embedding index stay local under models/ and are Git-ignored.
-
-## 9. Run daily discovery
-
-After preflight passes:
-
-~~~
 ./scripts/run.sh
-~~~
+./scripts/run.sh --lookback-hours 48
+./scripts/run.sh --retrieval-only
+./scripts/run.sh --scoring-only --input path/to/saved-jobs.json
+```
 
-The workflow creates an approval report under reports/ and privacy-safe
-stage logs under logs/DD-MM-YYYY/. It waits for explicit approval before any
-application record is written.
+`--check` validates local readiness only; it does not test connector sign-in,
+provider access or hybrid cloud credentials, and it does not start a search.
 
-The normal approval replies are:
+If `codex` is installed in a non-default location, export its path before a
+terminal run:
 
-~~~text
-Approve all
-~~~
+```bash
+export CODEX_BIN="$(command -v codex)"
+./scripts/run.sh
+```
 
-or:
+The full command can incur Apify charges within the configured run allowance.
+The launcher saves its private run report under `reports/`. For a desktop Codex
+run, open this repository as a local project and request the job-search skill;
+native tasks invoke the skills directly and do not use `scripts/run.sh`.
 
-~~~text
-Approve 1, 3
-~~~
+Lookback resolution is user override, configuration, then default 24 hours.
+Full searches alternate bounded Seek, LinkedIn and Indeed batches with scoring.
+Default stops are five eligible jobs, 100 assessments or a USD 0.50 Apify retrieval
+allowance. New acquisitions use submission-relative freshness windows and supported date
+filters (Seek uses a day filter plus exact local validation); legacy
+retrieval-only checkpoints keep their original fixed windows. Unsupported source windows,
+result caps and incomplete coverage are visible. Discovery supervision defaults
+to 30 minutes; its deadline saves partial coverage without restarting Actors.
+Actor continuation is currently unsupported: capped queries are reported as
+noncontinuable rather than scraped repeatedly. Posting-time uncertainty stays
+visible. Configure optional `progressive_search` limits in search_targets.yaml;
+reusing downloaded results avoids repeat calls, while local deduplication alone
+cannot refund result charges. Evidence embedding and agent usage are separate
+from the Apify allowance. Paid progressive acquisitions use the Apify REST
+`maxTotalChargeUsd` run cap, refreshed pricing contracts and conservative event
+reservations. The skill refreshes `.state/apify-charge-contracts.json` before a
+new session; unknown submissions remain blocked. Websift Seek results include full descriptions; optional salary estimation is
+disabled. Historical Bovi runs retain their page-inspection fallback.
+Complete zero results succeed. Scoring reads one job per inspect page by default,
+with at most three jobs per submission; full responses remain private.
 
-Approval applies only to the named candidates in the current report. It does
-not authorize applications, employer contact, or resume changes.
+Keyword-only mode needs no OpenAI/Chroma packages or keys. Hybrid mode adds
+`requirements-semantic.txt` and the existing embedding/vector credentials;
+unchanged inputs reuse their vectors. No generation API fallback is used.
+Configured Indeed and Apify connectors provide job discovery; Apify launcher
+credentials are loaded as data from the environment or private `.env`. Saved-job
+scoring needs no source credentials.
 
-## 10. Enable optional private writes
+Initial runs create no application records, resumes or cover letters. Current
+report approval permits only named candidates at enabled destinations after
+repeat checks. Source resumes stay immutable and letters need separate approval.
 
-Writes are disabled by default. After reviewing the workflow and schemas, set
-only the destinations you want:
+## Future scheduled runs
 
-~~~
-WRITE_OBSIDIAN=true ./scripts/run.sh
-WRITE_NOTION=true ./scripts/run.sh
-~~~
+A native scheduled Codex task runs directly in this local project. Example prompt:
 
-Before enabling them, read:
+> Run the full job-search workflow for the latest 24 hours using AGENTS.md and
+> the job-search router. Continue to the numbered candidate report and wait for my
+> selection. Preserve partial coverage and report concrete blockers.
 
-- config/obsidian_schema.md
-- config/notion_schema.md
-- docs/04-obsidian-write.md
-- docs/05-application-workspace.md
+Use Australia/Melbourne time when creating a morning schedule after an explicit
+request. This change creates no schedule and assumes no morning execution time.
+The machine and desktop app must be running, with project files and connectors
+available. Native tasks invoke the skills directly; `scripts/run.sh` launches a
+CLI agent for terminal runs and must not be nested inside a native task.
+Scheduled execution supplies no approval for destination writes.
 
-Obsidian and Notion application records are operational records, not career
-evidence. The workflow repeats duplicate checks before writing and records a
-disabled destination as skipped, not as a failure.
+## Project map
 
-## 11. Add or maintain a source
+See [the scripts map](scripts/README.md) for entry points and internal modules.
 
-For an existing adapter:
-
-1. Add or update its public endpoint in config/source_boards.yaml.
-2. Run the source alone with --sources <source_id> --days 7.
-3. Check that recent jobs have reliable dates, canonical URLs, titles, and
-   locations.
-4. Confirm returned jobs match config/search_targets.yaml.
-5. Add parser fixtures and unit tests in tests/test_job_sources.py.
-6. Update docs/06-source-adapters.md if the source has special behavior.
-7. Run the full test suite and a live smoke test.
-
-For a genuinely new provider, add an Adapter implementation, register it in
-the ADAPTERS map, normalize records into the shared Job dataclass, and fail
-closed when the source cannot prove posting date or job identity. Avoid adding
-credentials, broad scraping fallbacks, or speculative abstractions.
-
-## 12. Troubleshooting
-
-| Symptom | Action |
+| Area | Responsibility |
 | --- | --- |
-| Missing .env | Create .env with APIFY_TOKEN for the full pipeline. Source-only verification does not need it. |
-| pdftotext is required | Install Poppler and confirm pdftotext is on PATH. |
-| Semantic retrieval is not ready | Install requirements-semantic.txt, then run the one-time model-download command above. |
-| Playwright browser error | Run ./.venv/bin/python -m playwright install chromium. |
-| Zero matching jobs | Check title spelling, city names, posting dates, and the source's current inventory. Zero is a valid result. |
-| HTTP 403 or Cloudflare | The portal is blocking automated access. Do not bypass it blindly; record the limitation or add an official structured feed. |
-| Notion write fails | Confirm NOTION_DATABASE_ID, connector authentication, database sharing, and config/notion_schema.md. |
+| `.agents/skills/job-search/` | Progressive coordination, retrieval budget and aggregate report. |
+| `.agents/skills/job-retrieval/` | Complete discovery procedure. |
+| `.agents/skills/job-scoring/` | Assessment and ranked reporting. |
+| `.agents/skills/job-suggestions/` | Selection validation and approved-only suggestions. |
+| `scripts/readiness.py` | Shared private readiness cache and invalidation. |
+| `.agents/skills/job-retrieval/scripts/discovery.py`, `.agents/skills/job-retrieval/scripts/discovery_bridge.js` | Supervised configured-source checkpoints and recovery. |
+| `.agents/skills/job-scoring/scripts/assessment.py` | Private assessment, resumable judgments and ranked scoring reports. |
+| `.agents/skills/job-scoring/scripts/scoring.py` | Internal validated score arithmetic. |
+| `.agents/skills/job-retrieval/references/sources.md`, `.agents/skills/job-scoring/references/scoring.md` | Connector and score definitions. |
+| `docs/approved-destination-writes.md`, `docs/application-package-reference.md` | Separately approved preparation. |
 
-## 13. Project map
+## Maintaining sources
 
-- AGENTS.md — non-negotiable workflow and safety rules.
-- config/search_targets.yaml — title/location searches and discovery policy.
-- config/source_boards.yaml — additional source registry.
-- scripts/job_sources.py — source retrieval, normalization, freshness, and matching.
-- scripts/run.sh — full preflight, discovery orchestration, and approval report.
-- career-vault/ — verified personal career evidence.
-- docs/01-crawl.md through docs/06-source-adapters.md — detailed workflow rules.
-- tests/ — deterministic parser, logging, ledger, and evidence tests.
+The separate ATS/government verifier uses optional `requirements-sources.txt`.
+See `docs/additional-source-adapters.md`; those sources are not silently added to discovery.
+Private state/reports/logs and career evidence remain preserved. CLI completed-turn
+usage has separate full-turn scope; unavailable native usage remains null.
 
-When changing behavior, update the relevant configuration, tests, and docs
-together. Keep the production 24-hour policy separate from the seven-day source
-verification window.
+Implementation checks use saved fixtures. Necessary live acceptance is limited
+to one platform/pair, max three results, with no automatic repeat or full paid
+benchmark crawl. Historical specifications and verification notes describe their
+original implementations; current skills and helpers define the active workflow.
+
+## Skill resource ownership
+
+Stage-specific executables and references live inside their skill's scripts/ and
+references/ directories. Shared readiness, evidence, provenance, private I/O and
+logging utilities remain in the repository scripts/ directory. Destination
+procedures stay in docs/ because AGENTS.md coordinates them after suggestions;
+optional source-adapter documentation also remains there for manual maintenance.
+
+Human selection is validated with:
+
+```bash
+./.venv/bin/python .agents/skills/job-suggestions/scripts/approved_preparation.py select --run HANDLE --report-id REPORT_ID --numbers 1 2
+```
+
+The returned preparation handle is used by job-suggestions. This command saves
+only private selected-job state, not destination records. Scheduling still ends
+at the scoring report and cannot implicitly select jobs.

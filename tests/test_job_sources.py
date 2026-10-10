@@ -27,6 +27,28 @@ class JobSourceTests(unittest.TestCase):
         self.assertFalse(job_sources.matches_search(bad_title, searches))
         self.assertFalse(job_sources.matches_search(bad_location, searches))
 
+    def test_one_title_can_configure_multiple_locations(self) -> None:
+        searches = job_sources.search_terms(
+            [{"title": "AI Engineer", "location": ["Melbourne", "Sydney", "Perth"]}]
+        )
+        self.assertEqual([location for _, location, _ in searches], ["Melbourne", "Sydney", "Perth"])
+        melbourne = job_sources.Job("test", "1", "https://example.com/1", "Example", "AI Engineer", "Melbourne, VIC", "2026-09-29T00:00:00+00:00", None, None, None, "")
+        sydney = melbourne.__class__(**{**melbourne.__dict__, "location": "Sydney, NSW"})
+        brisbane = melbourne.__class__(**{**melbourne.__dict__, "location": "Brisbane, QLD"})
+        self.assertTrue(job_sources.matches_search(melbourne, searches))
+        self.assertTrue(job_sources.matches_search(sydney, searches))
+        self.assertFalse(job_sources.matches_search(brisbane, searches))
+
+    def test_duplicate_title_entries_are_merged_for_browser_searches(self) -> None:
+        searches = job_sources._unique_title_searches(
+            [
+                {"title": "AI Engineer", "location": "Melbourne"},
+                {"title": "AI Engineer", "location": ["Sydney", "Perth"]},
+            ]
+        )
+        self.assertEqual(len(searches), 1)
+        self.assertEqual(searches[0]["location"], ["Melbourne", "Sydney", "Perth"])
+
     def test_seven_day_window_rejects_old_and_missing_dates(self) -> None:
         now = datetime(2026, 9, 30, tzinfo=UTC)
         fresh = job_sources.Job("test", "1", "https://example.com/1", "Example", "AI Engineer", "Melbourne", "2026-09-25T00:00:00+00:00", None, None, None, "")

@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,9 @@ DISCOVERY_OUTCOMES = {"fetch", "reject", "retain"}
 OBSIDIAN_STATUSES = {"written", "failed", "skipped"}
 NOTION_STATUSES = {"confirmed", "failed", "skipped"}
 SUCCESS_STATUSES = {"written", "confirmed"}
-SCORING_STATUSES = {"qualified", "below_threshold", "ineligible"}
+SCORING_STATUSES = {"qualified", "below_threshold"}
+CONDITION_STATUSES = {"passed", "failed", "manual_review"}
+TIMING_PHASES = {"stage2", "eligibility", "retrieval", "fit", "resume"}
 
 
 def project_root() -> Path:
@@ -33,6 +36,10 @@ def default_log_root() -> Path:
 
 def default_state_dir() -> Path:
     return project_root() / ".state" / "pipeline-logs"
+
+
+def default_timer_dir() -> Path:
+    return project_root() / ".state" / "stage-timers"
 
 
 def utc_now() -> str:
@@ -226,7 +233,6 @@ def run_suggestion(args: argparse.Namespace) -> int:
                     args.output_tokens,
                     args.reasoning_output_tokens,
                     cost,
-                    elapsed_seconds,
                 )
             ),
         }
@@ -265,12 +271,79 @@ def run_scoring_job(args: argparse.Namespace) -> int:
                     args.output_tokens,
                     args.reasoning_output_tokens,
                     args.cost_estimate_usd,
-                    args.elapsed_seconds,
                 )
             ),
         }
     )
     append_record(path, record)
+    return 0
+
+
+def run_condition_check_job(args: argparse.Namespace) -> int:
+    manifest, path = context(args)
+    if args.status not in CONDITION_STATUSES:
+        raise ValueError(f"invalid condition-check status: {args.status}")
+    record = base_record(manifest, "condition_check_job")
+    record.update(
+        {
+            "job_id": require_job_id(args.job_id, args.job_url),
+            "company": compact(args.company, 120),
+            "position": compact(args.position, 120),
+            "status": args.status,
+            "reason": compact(args.reason, 240),
+        }
+    )
+    append_record(path, record)
+    return 0
+
+
+def timer_path(args: argparse.Namespace) -> Path:
+    return run_state_path(args.timer_dir, f"{args.run_id}-{args.phase}")
+
+
+def run_timing_start(args: argparse.Namespace) -> int:
+    context(args)
+    target = timer_path(args)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    payload = {
+        "run_id": args.run_id,
+        "phase": args.phase,
+        "started_at": utc_now(),
+        "started_monotonic_ns": time.monotonic_ns(),
+    }
+    try:
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        raise ValueError(f"timing already started for {args.phase}") from error
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+        handle.write("\n")
+    return 0
+
+
+def run_timing_stop(args: argparse.Namespace) -> int:
+    manifest, path = context(args)
+    target = timer_path(args)
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise ValueError(f"timing was not started for {args.phase}") from error
+    if not isinstance(payload, dict) or payload.get("run_id") != args.run_id or payload.get("phase") != args.phase:
+        raise ValueError("timing record does not match the run and phase")
+    if type(payload.get("started_monotonic_ns")) is not int or not isinstance(payload.get("started_at"), str):
+        raise ValueError("timing start record is incomplete")
+    elapsed_ns = time.monotonic_ns() - payload["started_monotonic_ns"]
+    if elapsed_ns < 0:
+        raise ValueError("monotonic clock reset during timing")
+    record = base_record(manifest, "stage_timing")
+    record.update({
+        "phase": args.phase,
+        "started_at": payload["started_at"],
+        "finished_at": utc_now(),
+        "elapsed_seconds": round(elapsed_ns / 1_000_000_000, 3),
+    })
+    append_record(path, record)
+    target.unlink()
     return 0
 
 
@@ -426,6 +499,21 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     scoring_job.add_argument("--cost-estimate-usd", type=float)
     scoring_job.add_argument("--elapsed-seconds", type=float)
 
+    condition_check = subparsers.add_parser("condition-check-job")
+    add_context_arguments(condition_check, "scoring")
+    condition_check.add_argument("--job-id")
+    condition_check.add_argument("--job-url")
+    condition_check.add_argument("--company", required=True)
+    condition_check.add_argument("--position", required=True)
+    condition_check.add_argument("--status", required=True, choices=sorted(CONDITION_STATUSES))
+    condition_check.add_argument("--reason", required=True)
+
+    for command in ("timing-start", "timing-stop"):
+        timing = subparsers.add_parser(command)
+        add_context_arguments(timing, "scoring")
+        timing.add_argument("--phase", required=True, choices=sorted(TIMING_PHASES))
+        timing.add_argument("--timer-dir", type=Path, default=default_timer_dir())
+
     storage_job = subparsers.add_parser("storage-job")
     add_context_arguments(storage_job, "storage")
     storage_job.add_argument("--job-id")
@@ -457,6 +545,12 @@ def main(argv: list[str] | None = None) -> int:
         return run_suggestion(args)
     if args.command == "scoring-job":
         return run_scoring_job(args)
+    if args.command == "condition-check-job":
+        return run_condition_check_job(args)
+    if args.command == "timing-start":
+        return run_timing_start(args)
+    if args.command == "timing-stop":
+        return run_timing_stop(args)
     if args.command == "storage-job":
         return run_storage_job(args)
     if args.command == "storage-summary":

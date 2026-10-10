@@ -213,7 +213,7 @@ class VaultEvidenceTests(unittest.TestCase):
             service.embeddings = np.ones((len(service.candidates), 2), dtype="float32")
             service.query_cache_path = service.index_path / "query-cache.json"
             service.query_cache = {
-                "schema_version": vault_evidence.EMBEDDING_INDEX_SCHEMA_VERSION,
+                "schema_version": vault_evidence.CHROMA_INDEX_SCHEMA_VERSION,
                 "model": service.model_name,
                 "vault_fingerprint": service.fingerprint,
                 "entries": {},

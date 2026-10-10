@@ -11,3 +11,23 @@ reports/
 .venv*/
 models/
 logs/launchd*.log
+
+# Ignore all dotfiles and dot-directories used by local tools. Keep this file
+# as the only versioned dotfile in the repository.
+.*
+!/.gitignore
+
+# Local agent instructions and machine-specific rules.
+AGENTS.md
+
+# Keep personal career evidence and application records local.
+career-vault/.obsidian/
+career-vault/01 Profile/
+career-vault/02 Experience/
+career-vault/03 Projects/
+career-vault/04 Skills/
+career-vault/05 Evidence/
+career-vault/06 Stories/
+career-vault/07 Applications/01 Active/*
+career-vault/07 Applications/99 Archive/*
+career-vault/99 Archive/

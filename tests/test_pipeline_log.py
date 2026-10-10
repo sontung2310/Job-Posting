@@ -7,6 +7,7 @@ import unittest
 from argparse import Namespace
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 
@@ -108,14 +109,93 @@ class PipelineLogTests(unittest.TestCase):
                 output_tokens=None,
                 reasoning_output_tokens=None,
                 cost_estimate_usd=None,
-                elapsed_seconds=None,
+                elapsed_seconds=1.25,
             )
         )
         record = self.records("scoring")[0]
         self.assertEqual(record["candidate_evidence_fit"], 82)
         self.assertIsNone(record["cost_estimate_usd"])
-        self.assertIsNone(record["elapsed_seconds"])
+        self.assertEqual(record["elapsed_seconds"], 1.25)
         self.assertFalse(record["usage_available"])
+
+    def test_condition_failure_is_logged_without_score_or_profile_data(self) -> None:
+        private_url = "https://jobs.example.test/role?candidate=private"
+        pipeline_log.run_condition_check_job(
+            self.args(
+                "scoring",
+                job_id=None,
+                job_url=private_url,
+                company="Example",
+                position="AI Engineer",
+                status="failed",
+                reason="Explicit work-authorization condition is unmet.",
+            )
+        )
+        record = self.records("scoring")[0]
+        rendered = json.dumps(record)
+        self.assertEqual(record["record_type"], "condition_check_job")
+        self.assertEqual(record["status"], "failed")
+        self.assertNotIn("candidate_evidence_fit", record)
+        self.assertNotIn(private_url, rendered)
+        self.assertNotIn("Temporary Graduate", rendered)
+        self.assertEqual(record["job_id"], pipeline_log.require_job_id(None, private_url))
+
+    def test_manual_review_condition_can_continue_without_becoming_a_failure(self) -> None:
+        pipeline_log.run_condition_check_job(
+            self.args(
+                "scoring",
+                job_id="job-manual-review",
+                job_url=None,
+                company="Example",
+                position="AI Engineer",
+                status="manual_review",
+                reason="The JD condition needs manual checking.",
+            )
+        )
+        record = self.records("scoring")[0]
+        self.assertEqual(record["status"], "manual_review")
+        self.assertNotIn("candidate_evidence_fit", record)
+
+    def test_ineligible_cannot_be_logged_as_a_scored_job(self) -> None:
+        with self.assertRaisesRegex(ValueError, "invalid scoring status"):
+            pipeline_log.run_scoring_job(
+                self.args(
+                    "scoring",
+                    job_id="job-3",
+                    job_url=None,
+                    company="Example",
+                    position="AI Engineer",
+                    score=90,
+                    status="ineligible",
+                    reason="A gate failed.",
+                    input_tokens=None,
+                    cached_input_tokens=None,
+                    output_tokens=None,
+                    reasoning_output_tokens=None,
+                    cost_estimate_usd=None,
+                    elapsed_seconds=None,
+                )
+            )
+
+    def test_stage_timing_uses_a_real_start_and_stop_clock(self) -> None:
+        args = self.args(
+            "scoring",
+            phase="stage2",
+            timer_dir=self.root / "timers",
+        )
+        with patch.object(pipeline_log.time, "monotonic_ns", side_effect=[1_000_000_000, 1_500_000_000, 2_250_000_000]):
+            pipeline_log.run_timing_start(args)
+            with self.assertRaisesRegex(ValueError, "already started"):
+                pipeline_log.run_timing_start(args)
+            pipeline_log.run_timing_stop(args)
+        record = self.records("scoring")[0]
+        self.assertEqual(record["record_type"], "stage_timing")
+        self.assertEqual(record["phase"], "stage2")
+        self.assertEqual(record["elapsed_seconds"], 1.25)
+        self.assertIn("started_at", record)
+        self.assertIn("finished_at", record)
+        with self.assertRaisesRegex(ValueError, "not started"):
+            pipeline_log.run_timing_stop(args)
 
 
 if __name__ == "__main__":

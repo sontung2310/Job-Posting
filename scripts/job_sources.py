@@ -450,16 +450,31 @@ def _browser_settings(config: dict[str, Any]) -> tuple[bool, int, int]:
 
 
 def _unique_title_searches(searches: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Avoid repeating the same browser search for city variants a portal cannot filter."""
+    """Run one browser search per title while merging its configured locations."""
     result: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    by_title: dict[str, dict[str, Any]] = {}
     for search in searches:
         title = compact_text(search.get("title"))
-        if not title or title.casefold() in seen:
+        if not title:
             continue
-        seen.add(title.casefold())
-        result.append(search)
+        key = title.casefold()
+        locations = search_locations(search)
+        existing = by_title.get(key)
+        if existing is None:
+            existing = dict(search)
+            existing["location"] = locations
+            by_title[key] = existing
+            result.append(existing)
+        else:
+            existing["location"] = list(dict.fromkeys([*search_locations(existing), *locations]))
     return result
+
+
+def search_locations(search: dict[str, Any]) -> list[str]:
+    """Return configured locations while accepting both scalar and list syntax."""
+    value = search.get("location")
+    values = value if isinstance(value, list) else [value]
+    return list(dict.fromkeys(compact_text(item) for item in values if compact_text(item)))
 
 
 def _require_playwright() -> Any:
@@ -671,9 +686,10 @@ async def _wa_fetch_async(portal: dict[str, Any], searches: list[dict[str, Any]]
         context = await browser.new_context(locale="en-AU", viewport={"width": 1440, "height": 1200})
         detail_semaphore = asyncio.Semaphore(max_concurrency)
 
-        def requested_terms(search: dict[str, Any]) -> tuple[set[str], str]:
+        def requested_terms(search: dict[str, Any]) -> tuple[set[str], tuple[str, ...]]:
             terms = {token for token in re.findall(r"[a-z0-9]+", compact_text(search.get("title")).lower()) if token not in STOPWORDS}
-            return terms, compact_text(search.get("location")).lower()
+            locations = tuple(location.casefold() for location in search_locations(search))
+            return terms, locations
 
         async def fetch_search(search: dict[str, Any]) -> list[Job]:
             page = await context.new_page()
@@ -683,12 +699,15 @@ async def _wa_fetch_async(portal: dict[str, Any], searches: list[dict[str, Any]]
                 if response and response.status >= 400:
                     raise SourceError(f"Western Australia returned HTTP {response.status}")
                 cards = parse_wa_listing_cards(await page.content())
-                terms, requested_location = requested_terms(search)
+                terms, requested_locations = requested_terms(search)
                 candidates = [
                     card
                     for card in cards
                     if terms.issubset(set(re.findall(r"[a-z0-9]+", card["title"].lower())))
-                    and (not requested_location or requested_location in card["location"].lower())
+                    and (
+                        not requested_locations
+                        or any(location in card["location"].casefold() for location in requested_locations)
+                    )
                 ]
 
                 async def fetch_detail(card: dict[str, str]) -> Job | None:
@@ -865,10 +884,10 @@ def search_terms(searches: list[dict[str, Any]]) -> list[tuple[str, str, set[str
     result = []
     for search in searches:
         title = compact_text(search.get("title"))
-        location = compact_text(search.get("location"))
         tokens = {token.lower() for token in re.findall(r"[a-z0-9]+", title.lower()) if token not in STOPWORDS}
-        if title and location and tokens:
-            result.append((title, location, tokens))
+        if title and tokens:
+            for location in search_locations(search):
+                result.append((title, location, tokens))
     return result
 
 

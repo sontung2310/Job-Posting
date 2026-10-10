@@ -47,12 +47,15 @@ with malformed frontmatter or incomplete verification metadata is not eligible
 and is reported by `check`; it is never interpreted optimistically. The parser
 will not write vault files.
 
-Search uses two local signals: literal keyword matching over JD terms and a
-Sentence Transformers embedding similarity between the original JD requirement
-and each eligible section. It rebuilds the small corpus in memory for each query
-and writes no vector index. The embedding model is downloaded only after an
-explicit command flag and cached in a Git-ignored workspace directory; vault text
-never leaves the machine.
+`hybrid_search` selects the retrieval mode. When true, the explicit
+`scripts/index_vault_chroma.py` sends each eligible section to OpenAI's
+`text-embedding-3-small` API and stores its vector, citation metadata, and a
+fingerprint of eligible indexing inputs in Chroma Cloud. Scoring sends each JD
+requirement to OpenAI for query embedding, then sends that vector to Chroma for
+comparison. Chroma stores no source text. Hybrid preflight sends the fixed text
+`preflight` to OpenAI to verify embedding access before paid discovery.
+When false, the utility does keyword retrieval only and does not call OpenAI or
+connect to Chroma.
 
 There is no project-controlled terminology map. The Codex workflow supplies the
 full JD requirement and may add exact JD terms (such as an acronym or product
@@ -62,7 +65,7 @@ an evidence strength.
 
 ### Hybrid retrieval, agent-led evidence judgement
 
-The utility owns deterministic validation, filtering, local hybrid retrieval, and
+The utility owns deterministic validation, filtering, configurable retrieval, and
 traceable candidate output. The Codex workflow owns JD requirement extraction,
 contextual choice of literal terms, priority allocation, evaluation of direct
 versus transferable evidence, and the final scoring table. This lets the LLM use
@@ -113,8 +116,8 @@ scores and short reasons but intentionally omits token and cost estimates.
 - [A required fact is missing from the vault] → Preflight and hard gates stop a
   false-positive recommendation; the report explains the missing requirement.
 - [Lexical search misses differently worded evidence] → Combine literal matches
-  with local semantic retrieval; inspect project, experience, and evidence
-  candidates before deciding a gap.
+  with Chroma Cloud vector retrieval when `hybrid_search` is enabled; inspect
+  project, experience, and evidence candidates before deciding a gap.
 - [Semantic search overstates related experience] → Treat all retrieval output as
   a candidate; require cited, verified text before classifying it as direct or
   transferable, and never let semantic similarity satisfy a hard requirement.
@@ -131,7 +134,7 @@ scores and short reasons but intentionally omits token and cost estimates.
 
 ## Migration Plan
 
-1. Add the hybrid retrieval utility, its local embedding dependency, and unit
+1. Add the hybrid retrieval utility, its OpenAI embedding dependency, and unit
    fixtures/tests.
 2. Update preflight scripts and workflow instructions together, including the
    daily-run prompt and Obsidian-record guidance.

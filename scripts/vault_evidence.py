@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and search the local career evidence vault."""
+"""Validate the local vault and retrieve eligible evidence from Chroma Cloud."""
 
 from __future__ import annotations
 
@@ -30,11 +30,11 @@ REQUIRED_NOTE_TYPES = {
 }
 HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 FRONTMATTER_PATTERN = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*):(?:\s*(.*))?$")
-DEFAULT_SEMANTIC_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_EMBEDDING_INDEX_PATH = "models/vault-embeddings"
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+DEFAULT_CHROMA_COLLECTION = "career-vault-evidence-openai"
 DEFAULT_EVIDENCE_SOCKET = ".state/vault-evidence.sock"
-DEFAULT_EVIDENCE_REQUEST_DIR = ".state/vault-evidence-requests"
-EMBEDDING_INDEX_SCHEMA_VERSION = 1
+CHROMA_INDEX_SCHEMA_VERSION = 3
+EVIDENCE_SERVICE_VERSION = "openai-chroma-v2"
 DEFAULT_KEYWORD_WEIGHT = 0.4
 DEFAULT_SEMANTIC_WEIGHT = 0.6
 DEFAULT_SEMANTIC_MIN_SCORE = 0.20
@@ -72,33 +72,7 @@ class EvidenceCandidate:
 
 
 class SemanticSearchUnavailable(RuntimeError):
-    """Raised when a requested local embedding model cannot be loaded."""
-
-
-def load_semantic_model(
-    model_name: str,
-    model_cache: Path,
-    allow_model_download: bool,
-) -> Any:
-    try:
-        from embedding_runtime import load_embedding_model
-    except ImportError as error:
-        raise SemanticSearchUnavailable(
-            "Local semantic search requires the local transformer runtime. "
-            "Install requirements-semantic.txt, then retry."
-        ) from error
-
-    try:
-        return load_embedding_model(
-            model_name,
-            model_cache,
-            allow_model_download,
-        )
-    except Exception as error:  # The library emits several model/cache exception types.
-        download_hint = " Re-run with --allow-model-download to download the model only."
-        raise SemanticSearchUnavailable(
-            f"Could not load local semantic model '{model_name}'.{download_hint}"
-        ) from error
+    """Raised when hybrid retrieval cannot embed text or reach its cloud services."""
 
 
 def project_root() -> Path:
@@ -109,20 +83,112 @@ def default_vault_path() -> Path:
     return project_root() / "career-vault"
 
 
-def default_model_cache_path() -> Path:
-    return project_root() / "models" / "sentence-transformers"
+def default_embedding_model() -> str:
+    return os.environ.get("OPENAI_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
 
 
-def default_embedding_index_path() -> Path:
-    return project_root() / DEFAULT_EMBEDDING_INDEX_PATH
+class OpenAIEmbeddingModel:
+    """Create embeddings with OpenAI's embeddings API."""
+
+    batch_size = 32
+
+    def __init__(self, model_name: str) -> None:
+        if model_name != DEFAULT_EMBEDDING_MODEL:
+            raise SemanticSearchUnavailable("Only text-embedding-3-small is permitted for hybrid retrieval.")
+        load_service_environment()
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise SemanticSearchUnavailable(
+                "OpenAI credentials are missing. Set OPENAI_API_KEY in the environment or .env."
+            )
+        try:
+            from openai import OpenAI
+        except ImportError as error:
+            raise SemanticSearchUnavailable(
+                "OpenAI embeddings require openai. Install requirements-semantic.txt, then retry."
+            ) from error
+        self.model_name = model_name
+        self.client = OpenAI(api_key=api_key, max_retries=0, timeout=60)
+        self.usage: list[dict[str, object]] = []
+
+    def _encode(self, texts: Sequence[str]) -> list[list[float]]:
+        embeddings: list[list[float]] = []
+        for start in range(0, len(texts), self.batch_size):
+            batch = list(texts[start : start + self.batch_size])
+            started = time.monotonic()
+            try:
+                response = self.client.embeddings.create(
+                    model=self.model_name,
+                    input=batch,
+                    encoding_format="float",
+                )
+            except Exception as error:
+                raise SemanticSearchUnavailable(
+                    f"OpenAI embeddings request failed ({type(error).__name__}); billable usage unknown."
+                ) from error
+            usage = getattr(response, "usage", None)
+            prompt_tokens = getattr(usage, "prompt_tokens", None)
+            total_tokens = getattr(usage, "total_tokens", None)
+            if (type(prompt_tokens) is not int or type(total_tokens) is not int
+                    or prompt_tokens < 0 or total_tokens < prompt_tokens):
+                raise SemanticSearchUnavailable("OpenAI embedding usage is unavailable or invalid.")
+            self.usage.append({"model": self.model_name, "prompt_tokens": prompt_tokens,
+                               "total_tokens": total_tokens,
+                               "elapsed_seconds": time.monotonic() - started,
+                               "cost_estimate_usd": None})
+            rows = sorted(response.data, key=lambda item: item.index)
+            if [row.index for row in rows] != list(range(len(batch))):
+                raise SemanticSearchUnavailable("OpenAI returned an incomplete embedding batch.")
+            if any(not row.embedding or any(not math.isfinite(value) for value in row.embedding) for row in rows):
+                raise SemanticSearchUnavailable("OpenAI returned invalid embedding vectors.")
+            embeddings.extend(row.embedding for row in rows)
+        return embeddings
+
+    def encode_document(self, documents: Sequence[str]) -> list[list[float]]:
+        return self._encode(documents)
+
+    def encode_queries(self, queries: Sequence[str]) -> list[list[float]]:
+        return self._encode(queries)
+
+
+def load_embedding_model(model_name: str) -> OpenAIEmbeddingModel:
+    try:
+        return OpenAIEmbeddingModel(model_name)
+    except SemanticSearchUnavailable:
+        raise
+    except Exception as error:
+        raise SemanticSearchUnavailable(
+            f"Could not initialize OpenAI embeddings ({type(error).__name__})."
+        ) from error
+
+
+def default_hybrid_search() -> bool:
+    config_path = project_root() / "config" / "search_targets.yaml"
+    try:
+        import yaml
+    except ImportError as error:
+        raise ValueError("Reading hybrid_search requires PyYAML; install requirements.txt.") from error
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as error:
+        raise ValueError(f"Could not read search configuration: {error}") from error
+    value = config.get("hybrid_search", True)
+    if not isinstance(value, bool):
+        raise ValueError("config/search_targets.yaml must set hybrid_search to true or false")
+    return value
+
+
+def parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
 
 
 def default_evidence_socket_path() -> Path:
     return project_root() / DEFAULT_EVIDENCE_SOCKET
-
-
-def default_evidence_request_dir() -> Path:
-    return project_root() / DEFAULT_EVIDENCE_REQUEST_DIR
 
 
 def normalize_text(value: str) -> str:
@@ -295,7 +361,7 @@ def primary_section_index(note: VaultNote) -> int:
 
 
 def candidate_document(candidate: EvidenceCandidate) -> str:
-    """Build the local-only text sent to the embedding model for one section."""
+    """Build the eligible section text sent to OpenAI for embedding."""
 
     return "\n".join(
         part
@@ -318,8 +384,20 @@ def build_candidates(notes: Iterable[VaultNote]) -> list[EvidenceCandidate]:
     ]
 
 
-def vault_fingerprint(vault_path: Path) -> str:
-    """Return a content fingerprint for the retrieval-eligible Markdown corpus."""
+def vault_fingerprint(candidates: Iterable[EvidenceCandidate]) -> str:
+    """Fingerprint only the candidate text and citation metadata sent to Chroma."""
+
+    digest = hashlib.sha256()
+    for candidate in candidates:
+        digest.update(candidate_id(candidate).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(candidate_document(candidate).encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def local_vault_fingerprint(vault_path: Path) -> str:
+    """Detect local note edits without uploading a hash of ineligible notes."""
 
     digest = hashlib.sha256()
     for path in sorted(vault_path.rglob("*.md")):
@@ -331,17 +409,6 @@ def vault_fingerprint(vault_path: Path) -> str:
         digest.update(path.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
-
-
-def candidate_keys(candidates: Sequence[EvidenceCandidate]) -> list[dict[str, object]]:
-    return [
-        {
-            "path": candidate.note.path.as_posix(),
-            "section_index": candidate.section_index,
-            "heading": candidate.section.heading,
-        }
-        for candidate in candidates
-    ]
 
 
 def keyword_score(
@@ -406,33 +473,187 @@ def keyword_score(
     return score, matched_terms
 
 
-def local_semantic_scores(
-    requirement: str,
-    candidates: Sequence[EvidenceCandidate],
-    model_name: str,
-    model_cache: Path,
-    allow_model_download: bool,
-) -> list[float]:
-    """Calculate cosine similarity locally; vault text is never sent to an API."""
+def candidate_id(candidate: EvidenceCandidate) -> str:
+    key = {
+        "path": candidate.note.path.as_posix(),
+        "section_index": candidate.section_index,
+        "heading": candidate.section.heading,
+    }
+    return hashlib.sha256(json.dumps(key, sort_keys=True).encode("utf-8")).hexdigest()
 
-    model = load_semantic_model(model_name, model_cache, allow_model_download)
 
+def load_service_environment() -> None:
+    """Read only Chroma and OpenAI API keys from .env without executing it."""
+
+    keys = {"CHROMA_API_KEY", "CHROMA_TENANT", "CHROMA_DATABASE", "OPENAI_API_KEY"}
+    env_file = project_root() / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        name, separator, value = line.partition("=")
+        if not separator or name.strip() not in keys or os.environ.get(name.strip()):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[name.strip()] = value
+
+
+def create_chroma_client() -> Any:
+    load_service_environment()
+    if not os.environ.get("CHROMA_API_KEY"):
+        raise SemanticSearchUnavailable(
+            "Chroma Cloud credentials are missing. Set CHROMA_API_KEY in the environment or .env."
+        )
     try:
-        corpus_embeddings = model.encode_document(
-            [candidate_document(candidate) for candidate in candidates],
-            convert_to_numpy=True,
-            normalize_embeddings=True,
+        import chromadb
+    except ImportError as error:
+        raise SemanticSearchUnavailable(
+            "Chroma search requires chromadb. Install requirements-semantic.txt, then retry."
+        ) from error
+    try:
+        return chromadb.CloudClient(
+            api_key=os.environ["CHROMA_API_KEY"],
+            tenant=os.environ.get("CHROMA_TENANT") or None,
+            database=os.environ.get("CHROMA_DATABASE") or None,
         )
-        query_embedding = model.encode_query(
-            requirement,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        )
-        return [float(value) for value in corpus_embeddings @ query_embedding]
     except Exception as error:
         raise SemanticSearchUnavailable(
-            f"Local semantic search failed while encoding the eligible vault: {error}"
+            f"Could not connect to Chroma Cloud ({type(error).__name__})."
         ) from error
+
+
+def get_chroma_collection(client: Any, create: bool = False) -> Any:
+    try:
+        if create:
+            return client.get_or_create_collection(
+                name=DEFAULT_CHROMA_COLLECTION,
+                embedding_function=None,
+            )
+        return client.get_collection(
+            name=DEFAULT_CHROMA_COLLECTION,
+            embedding_function=None,
+        )
+    except Exception as error:
+        operation = "create or open" if create else "open"
+        raise SemanticSearchUnavailable(
+            f"Could not {operation} Chroma collection '{DEFAULT_CHROMA_COLLECTION}' "
+            f"({type(error).__name__})."
+        ) from error
+
+
+def chroma_index_metadata(model_name: str, fingerprint: str, count: int) -> dict[str, object]:
+    return {
+        "schema_version": CHROMA_INDEX_SCHEMA_VERSION,
+        "embedding_model": model_name,
+        "vault_fingerprint": fingerprint,
+        "candidate_count": count,
+        "vector_metric": "normalized_l2",
+    }
+
+
+def validate_chroma_index(
+    collection: Any,
+    model_name: str,
+    fingerprint: str,
+    candidate_count: int,
+) -> None:
+    metadata = collection.metadata or {}
+    expected = chroma_index_metadata(model_name, fingerprint, candidate_count)
+    if any(metadata.get(key) != value for key, value in expected.items()):
+        raise SemanticSearchUnavailable(
+            "Chroma Cloud does not contain a current index for this vault and model. "
+            "Run ./.venv/bin/python scripts/index_vault_chroma.py first."
+        )
+    try:
+        count = collection.count()
+    except Exception as error:
+        raise SemanticSearchUnavailable(
+            f"Could not read the Chroma Cloud index ({type(error).__name__})."
+        ) from error
+    if count != candidate_count:
+        raise SemanticSearchUnavailable(
+            "The Chroma Cloud index count does not match the eligible vault sections. "
+            "Run ./.venv/bin/python scripts/index_vault_chroma.py first."
+        )
+
+
+def build_chroma_index(
+    vault_path: Path,
+    model_name: str,
+) -> int:
+    if model_name != DEFAULT_EMBEDDING_MODEL:
+        raise SemanticSearchUnavailable("Only text-embedding-3-small is permitted for hybrid retrieval.")
+    notes, parse_errors = scan_vault(vault_path)
+    errors = validation_errors(notes, parse_errors)
+    if errors:
+        raise ValueError("Vault index preflight failed: " + "; ".join(errors))
+
+    candidates = build_candidates(notes)
+    if not candidates:
+        raise ValueError("No eligible vault sections are available to index.")
+    fingerprint = vault_fingerprint(candidates)
+
+    client = create_chroma_client()
+    collection = get_chroma_collection(client, create=True)
+    expected = chroma_index_metadata(model_name, fingerprint, len(candidates))
+    if all((collection.metadata or {}).get(key) == value for key, value in expected.items()):
+        try:
+            if collection.count() == len(candidates):
+                return len(candidates)
+        except Exception as error:
+            raise SemanticSearchUnavailable(
+                f"Could not read the Chroma Cloud index ({type(error).__name__})."
+            ) from error
+    model = load_embedding_model(model_name)
+
+    ids = [candidate_id(candidate) for candidate in candidates]
+    metadatas = [
+        {
+            "path": candidate.note.path.as_posix(),
+            "section_index": candidate.section_index,
+            "heading": candidate.section.heading,
+        }
+        for candidate in candidates
+    ]
+
+    batch_size = 100
+    for start in range(0, len(candidates), batch_size):
+        end = start + batch_size
+        try:
+            embeddings = model.encode_document(
+                [candidate_document(candidate) for candidate in candidates[start:end]]
+            )
+            collection.upsert(
+                ids=ids[start:end],
+                embeddings=embeddings,
+                metadatas=metadatas[start:end],
+            )
+        except Exception as error:
+            raise SemanticSearchUnavailable(
+                f"Could not embed or write a vault batch to OpenAI/Chroma Cloud ({type(error).__name__})."
+            ) from error
+
+    current_ids = set(ids)
+    try:
+        stored_ids = collection.get(include=["metadatas"]).get("ids", [])
+        stale_ids = [record_id for record_id in stored_ids if record_id not in current_ids]
+        for start in range(0, len(stale_ids), batch_size):
+            collection.delete(ids=stale_ids[start : start + batch_size])
+        collection.modify(metadata=chroma_index_metadata(
+            model_name,
+            fingerprint,
+            len(candidates),
+        ))
+    except Exception as error:
+        raise SemanticSearchUnavailable(
+            f"Could not finalize the Chroma Cloud index ({type(error).__name__})."
+        ) from error
+
+    return len(candidates)
 
 
 def validate_weights(keyword_weight: float, semantic_weight: float) -> None:
@@ -473,8 +694,8 @@ def search_notes(
 
     if semantic_scorer is None:
         raise SemanticSearchUnavailable(
-            "Hybrid search requires a local semantic scorer; use --semantic-mode off "
-            "only for lexical diagnostics."
+            "Hybrid search requires a semantic scorer; use --hybrid-search false "
+            "only for keyword retrieval."
         )
 
     semantic_scores = list(semantic_scorer(normalized_requirement, candidates))
@@ -556,7 +777,6 @@ def result_payload(
     matches: Sequence[dict[str, object]],
     semantic_mode: str,
     semantic_model: str,
-    model_cache: Path,
     semantic_min_score: float,
     keyword_weight: float,
     semantic_weight: float,
@@ -569,7 +789,7 @@ def result_payload(
             "semantic": {
                 "mode": semantic_mode,
                 "model": semantic_model if semantic_mode == "required" else None,
-                "model_cache": model_cache.as_posix() if semantic_mode == "required" else None,
+                "vector_store": "Chroma Cloud" if semantic_mode == "required" else None,
                 "minimum_score": semantic_min_score if semantic_mode == "required" else None,
             },
             "weights": {
@@ -582,113 +802,55 @@ def result_payload(
 
 
 class EmbeddingIndexService:
-    """Serve many searches from one model load and one persisted corpus index."""
+    """Embed each requirement with OpenAI and retrieve indexed vectors from Chroma."""
 
     def __init__(
         self,
         vault_path: Path,
         model_name: str,
-        model_cache: Path,
-        index_path: Path,
-        allow_model_download: bool,
     ) -> None:
-        try:
-            import numpy as np
-        except ImportError as error:
-            raise SemanticSearchUnavailable(
-                "The embedding index requires numpy. Install requirements-semantic.txt, then retry."
-            ) from error
-
-        self.np = np
         self.vault_path = vault_path
         self.model_name = model_name
-        self.model_cache = model_cache
-        self.index_path = index_path
-        self.index_path.mkdir(parents=True, exist_ok=True)
         self.notes, self.parse_errors = scan_vault(vault_path)
         self.candidates = build_candidates(self.notes)
-        self.fingerprint = vault_fingerprint(vault_path)
-        self.model = load_semantic_model(model_name, model_cache, allow_model_download)
-        self.embeddings = self._load_or_build_index()
-        self.query_cache_path = self.index_path / "query-cache.json"
-        self.query_cache = self._load_query_cache()
+        self.fingerprint = vault_fingerprint(self.candidates)
+        self.local_fingerprint = local_vault_fingerprint(vault_path)
+        self.client = create_chroma_client()
+        self.collection = get_chroma_collection(self.client)
+        self.model = load_embedding_model(model_name)
+        self.query_cache: dict[str, object] = {"entries": {}}
+        self._check_index()
 
-    @property
-    def index_file(self) -> Path:
-        return self.index_path / "embeddings.npy"
-
-    @property
-    def metadata_file(self) -> Path:
-        return self.index_path / "metadata.json"
-
-    def _index_metadata(self) -> dict[str, object]:
-        return {
-            "schema_version": EMBEDDING_INDEX_SCHEMA_VERSION,
-            "model": self.model_name,
-            "vault_fingerprint": self.fingerprint,
-            "candidate_keys": candidate_keys(self.candidates),
-        }
-
-    def _load_or_build_index(self):
-        expected = self._index_metadata()
-        try:
-            metadata = json.loads(self.metadata_file.read_text(encoding="utf-8"))
-            embeddings = self.np.load(self.index_file, allow_pickle=False)
-            if metadata == expected and embeddings.shape[0] == len(self.candidates):
-                return embeddings
-        except (OSError, ValueError, json.JSONDecodeError):
-            pass
-
-        documents = [candidate_document(candidate) for candidate in self.candidates]
-        embeddings = self.model.encode_document(
-            documents,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        ).astype("float32")
-        self.np.save(self.index_file, embeddings)
-        self.metadata_file.write_text(json.dumps(expected, ensure_ascii=False, indent=2), encoding="utf-8")
-        return embeddings
-
-    def _load_query_cache(self) -> dict[str, object]:
-        try:
-            cache = json.loads(self.query_cache_path.read_text(encoding="utf-8"))
-            if (
-                cache.get("schema_version") == EMBEDDING_INDEX_SCHEMA_VERSION
-                and cache.get("model") == self.model_name
-                and cache.get("vault_fingerprint") == self.fingerprint
-                and isinstance(cache.get("entries"), dict)
-            ):
-                return cache
-        except (OSError, ValueError, json.JSONDecodeError):
-            pass
-        return {
-            "schema_version": EMBEDDING_INDEX_SCHEMA_VERSION,
-            "model": self.model_name,
-            "vault_fingerprint": self.fingerprint,
-            "entries": {},
-        }
-
-    def _save_query_cache(self) -> None:
-        temporary_path = self.query_cache_path.with_suffix(".tmp")
-        temporary_path.write_text(
-            json.dumps(self.query_cache, ensure_ascii=False),
-            encoding="utf-8",
+    def _check_index(self) -> None:
+        validate_chroma_index(
+            self.collection,
+            self.model_name,
+            self.fingerprint,
+            len(self.candidates),
         )
-        os.replace(temporary_path, self.query_cache_path)
 
     def _refresh_if_needed(self) -> None:
-        """Refresh a long-lived service after the vault changes on disk."""
+        """Refresh local evidence and require an explicit reindex after vault edits."""
 
-        current_fingerprint = vault_fingerprint(self.vault_path)
-        if current_fingerprint == self.fingerprint:
+        current_local_fingerprint = local_vault_fingerprint(self.vault_path)
+        if current_local_fingerprint == self.local_fingerprint:
             return
 
-        self.notes, self.parse_errors = scan_vault(self.vault_path)
-        self.candidates = build_candidates(self.notes)
-        self.fingerprint = current_fingerprint
-        self.embeddings = self._load_or_build_index()
-        self.query_cache = self._load_query_cache()
+        notes, parse_errors = scan_vault(self.vault_path)
+        candidates = build_candidates(notes)
+        current_fingerprint = vault_fingerprint(candidates)
+        if current_fingerprint != self.fingerprint:
+            validate_chroma_index(
+                self.collection,
+                self.model_name,
+                current_fingerprint,
+                len(candidates),
+            )
+            self.fingerprint = current_fingerprint
+        self.notes, self.parse_errors = notes, parse_errors
+        self.candidates = candidates
+        self.local_fingerprint = current_local_fingerprint
+        self.query_cache = {"entries": {}}
 
     def _cache_key(
         self,
@@ -745,7 +907,7 @@ class EmbeddingIndexService:
     def _search_prepared_request(
         self,
         prepared: dict[str, object],
-        query_embedding: Any,
+        semantic_scores: Sequence[float],
     ) -> dict[str, object]:
         requirement = str(prepared["requirement"])
         terms = list(prepared["terms"])  # type: ignore[arg-type]
@@ -754,7 +916,6 @@ class EmbeddingIndexService:
         semantic_min_score = float(prepared["semantic_min_score"])
         keyword_weight = float(prepared["keyword_weight"])
         semantic_weight = float(prepared["semantic_weight"])
-        semantic_scores = self.embeddings @ query_embedding
         matches = search_notes(
             self.notes,
             requirement,
@@ -773,24 +934,17 @@ class EmbeddingIndexService:
             matches,
             "required",
             self.model_name,
-            self.model_cache,
             semantic_min_score,
             keyword_weight,
             semantic_weight,
         )
 
     def search_requests(self, requests: Sequence[dict[str, object]]) -> list[dict[str, object]]:
-        """Search many requirements with one model call and one cache write.
-
-        Results are deduplicated by the complete request cache key. Query
-        embeddings are deduplicated separately by requirement text, so the
-        same requirement with different display limits or literal terms still
-        requires only one encoder pass.
-        """
+        """Batch query encoding and Chroma requests; cache results in process memory only."""
 
         self._refresh_if_needed()
         prepared_requests = [self._prepare_request(request) for request in requests]
-        entries = self.query_cache["entries"]
+        entries = self.query_cache.setdefault("entries", {})
         if not isinstance(entries, dict):
             entries = {}
             self.query_cache["entries"] = entries
@@ -820,21 +974,65 @@ class EmbeddingIndexService:
                     unique_requirements.setdefault(str(prepared["requirement"]), []).append((key, prepared))
 
             query_texts = list(unique_requirements)
-            query_embeddings = self.model.encode_queries(
-                query_texts,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )
-            for query_text, query_embedding in zip(query_texts, query_embeddings):
+            query_embeddings = self.model.encode_queries(query_texts)
+            semantic_by_requirement = self._semantic_scores(query_embeddings)
+            for query_text, semantic_scores in zip(query_texts, semantic_by_requirement):
                 for key, prepared in unique_requirements[query_text]:
-                    result = self._search_prepared_request(prepared, query_embedding)
+                    result = self._search_prepared_request(prepared, semantic_scores)
                     entries[key] = result
                     for index, _ in pending[key]:
                         results[index] = result
-            self._save_query_cache()
 
         return [result for result in results if result is not None]
+
+    def _semantic_scores(self, query_embeddings: Sequence[Sequence[float]]) -> list[list[float]]:
+        # Keep cloud query payloads small; independent chunks share one warm client.
+        if len(query_embeddings) > 5 and hasattr(self, "collection"):
+            from concurrent.futures import ThreadPoolExecutor
+            chunks = [query_embeddings[i:i+5] for i in range(0, len(query_embeddings), 5)]
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                return [row for chunk in executor.map(self._semantic_scores, chunks) for row in chunk]
+        if not self.candidates:
+            return [[] for _ in query_embeddings]
+
+        vectors = [[float(value) for value in embedding] for embedding in query_embeddings]
+        if not hasattr(self, "collection"):
+            # Supports deterministic in-memory service stand-ins without persisting vectors.
+            indexed_vectors = getattr(self, "embeddings", [])
+            return [
+                [
+                    math.fsum(float(value) * float(other) for value, other in zip(query, indexed))
+                    for indexed in indexed_vectors
+                ]
+                for query in vectors
+            ]
+        try:
+            result = self.collection.query(
+                query_embeddings=vectors,
+                n_results=len(self.candidates),
+                include=["distances"],
+            )
+        except Exception as error:
+            raise SemanticSearchUnavailable(
+                f"Chroma Cloud vector search failed ({type(error).__name__})."
+            ) from error
+
+        indices = {candidate_id(candidate): index for index, candidate in enumerate(self.candidates)}
+        scores_by_query: list[list[float]] = []
+        for ids, distances in zip(result.get("ids", []), result.get("distances", [])):
+            if len(ids) != len(indices) or any(record_id not in indices for record_id in ids):
+                raise SemanticSearchUnavailable("Chroma Cloud returned an incomplete or stale candidate set.")
+            scores = [0.0] * len(self.candidates)
+            for record_id, distance in zip(ids, distances):
+                index = indices.get(record_id)
+                if index is not None and distance is not None:
+                    # Chroma's default L2 metric is squared distance; normalized
+                    # vectors make cosine similarity equal to 1 - distance / 2.
+                    scores[index] = max(-1.0, min(1.0, 1.0 - float(distance) / 2.0))
+            scores_by_query.append(scores)
+        if len(scores_by_query) != len(vectors):
+            raise SemanticSearchUnavailable("Chroma Cloud returned an incomplete vector-search response.")
+        return scores_by_query
 
     def search_request(self, request: dict[str, object]) -> dict[str, object]:
         return self.search_requests([request])[0]
@@ -858,7 +1056,7 @@ class EvidenceRequestHandler(socketserver.StreamRequestHandler):
             else:
                 raise ValueError("unsupported evidence service command")
             response = {"ok": True, "result": result}
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        except (OSError, TypeError, ValueError, RuntimeError, json.JSONDecodeError) as error:
             response = {"ok": False, "error": str(error)}
         self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8") + b"\n")
 
@@ -883,6 +1081,8 @@ def request_evidence_service(socket_path: Path, request: dict[str, object]) -> d
 
 
 def request_evidence_file_service(request_dir: Path, request: dict[str, object]) -> dict[str, object]:
+    request_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(request_dir, 0o700)
     ready_path = request_dir / "READY"
     if not ready_path.exists():
         raise SemanticSearchUnavailable(f"Evidence service is not ready: {request_dir}")
@@ -891,7 +1091,7 @@ def request_evidence_file_service(request_dir: Path, request: dict[str, object])
     request_path = request_dir / f"{request_id}.request.json"
     response_path = request_dir / f"{request_id}.response.json"
     temporary_path = request_dir / f"{request_id}.request.tmp"
-    temporary_path.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
+    write_private_text(temporary_path, json.dumps(request, ensure_ascii=False))
     os.replace(temporary_path, request_path)
     deadline = time.monotonic() + 180
     try:
@@ -905,8 +1105,31 @@ def request_evidence_file_service(request_dir: Path, request: dict[str, object])
             time.sleep(0.02)
     finally:
         request_path.unlink(missing_ok=True)
+        response_path.unlink(missing_ok=True)
         temporary_path.unlink(missing_ok=True)
     raise SemanticSearchUnavailable(f"Evidence service timed out: {request_dir}")
+
+
+def write_private_text(path: Path, text: str) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            descriptor = -1
+            output.write(text)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def cleanup_stale_evidence_responses(request_dir: Path) -> None:
+    cutoff = time.time() - 600
+    for path in request_dir.glob("*.response.json"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 class EvidenceFileService:
@@ -916,11 +1139,19 @@ class EvidenceFileService:
         self.request_dir = request_dir
         self.evidence_service = evidence_service
         self.request_dir.mkdir(parents=True, exist_ok=True)
-        (self.request_dir / "READY").write_text("ready\n", encoding="utf-8")
+        os.chmod(self.request_dir, 0o700)
+        write_private_text(
+            self.request_dir / "READY",
+            f"{EVIDENCE_SERVICE_VERSION}:{self.evidence_service.model_name}\n",
+        )
 
     def serve_forever(self) -> None:
         try:
+            next_cleanup = 0.0
             while True:
+                if time.monotonic() >= next_cleanup:
+                    cleanup_stale_evidence_responses(self.request_dir)
+                    next_cleanup = time.monotonic() + 60
                 handled = False
                 for request_path in sorted(self.request_dir.glob("*.request.json")):
                     working_path = request_path.with_name(request_path.name.replace(".request.json", ".working.json"))
@@ -945,7 +1176,7 @@ class EvidenceFileService:
                     except (OSError, TypeError, ValueError, RuntimeError, json.JSONDecodeError) as error:
                         response = {"ok": False, "error": str(error)}
                     response_path = request_path.with_name(request_path.name.replace(".request.json", ".response.json"))
-                    response_path.write_text(json.dumps(response, ensure_ascii=False), encoding="utf-8")
+                    write_private_text(response_path, json.dumps(response, ensure_ascii=False))
                     working_path.unlink(missing_ok=True)
                 if not handled:
                     time.sleep(0.02)
@@ -960,9 +1191,6 @@ def run_serve(
     socket_path: Path,
     request_dir: Path | None,
     model_name: str,
-    model_cache: Path,
-    index_path: Path,
-    allow_model_download: bool,
     pid_file: Path | None,
 ) -> int:
     socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -974,15 +1202,12 @@ def run_serve(
     service = EmbeddingIndexService(
         vault_path,
         model_name,
-        model_cache,
-        index_path,
-        allow_model_download,
     )
     if request_dir is not None:
         file_service = EvidenceFileService(request_dir, service)
         print(
             f"Evidence service ready: {len(service.candidates)} candidates, "
-            f"index={index_path}, request_dir={request_dir}",
+            f"vector_store=Chroma Cloud, request_dir={request_dir}",
             flush=True,
         )
         try:
@@ -1003,7 +1228,7 @@ def run_serve(
         pass
     print(
         f"Evidence service ready: {len(service.candidates)} candidates, "
-        f"index={index_path}, socket={socket_path}",
+        f"vector_store=Chroma Cloud, socket={socket_path}",
         flush=True,
     )
     try:
@@ -1030,6 +1255,27 @@ def run_check(vault_path: Path) -> int:
     return 0
 
 
+def run_check_index(vault_path: Path, model_name: str) -> int:
+    if model_name != DEFAULT_EMBEDDING_MODEL:
+        raise SemanticSearchUnavailable("Only text-embedding-3-small is permitted for hybrid retrieval.")
+    notes, parse_errors = scan_vault(vault_path)
+    errors = validation_errors(notes, parse_errors)
+    if errors:
+        raise ValueError("Vault index preflight failed: " + "; ".join(errors))
+    candidates = build_candidates(notes)
+    # Validate local embedding prerequisites without sending a billable probe.
+    load_embedding_model(model_name)
+    collection = get_chroma_collection(create_chroma_client())
+    validate_chroma_index(
+        collection,
+        model_name,
+        vault_fingerprint(candidates),
+        len(candidates),
+    )
+    print(f"Chroma Cloud index is current: {len(candidates)} eligible sections.")
+    return 0
+
+
 def load_batch_requests(input_path: Path, default_limit: int, compact: bool) -> list[dict[str, object]]:
     raw_text = sys.stdin.read() if str(input_path) == "-" else input_path.read_text(encoding="utf-8")
     payload = json.loads(raw_text)
@@ -1051,15 +1297,50 @@ def load_batch_requests(input_path: Path, default_limit: int, compact: bool) -> 
     return requests
 
 
+def keyword_only_result(
+    notes: Sequence[VaultNote],
+    request: dict[str, object],
+    semantic_model: str,
+) -> dict[str, object]:
+    requirement = str(request["requirement"])
+    terms = request.get("terms", [])
+    if isinstance(terms, str):
+        terms = [terms]
+    limit = int(request.get("limit", 3))
+    if limit < 1:
+        raise ValueError("--limit must be at least 1")
+    candidates = build_candidates(notes)
+    matches = search_notes(
+        notes,
+        requirement,
+        [str(term) for term in terms],
+        limit,
+        semantic_scorer=lambda _query, _candidates: [0.0] * len(candidates),
+        semantic_min_score=1.0,
+        keyword_weight=1.0,
+        semantic_weight=0.0,
+    )
+    if bool(request.get("compact", True)):
+        matches = compact_matches(matches)
+    return result_payload(
+        requirement,
+        [str(term) for term in terms],
+        matches,
+        "off",
+        semantic_model,
+        1.0,
+        1.0,
+        0.0,
+    )
+
+
 def run_batch_search(
     vault_path: Path,
     input_path: Path,
     default_limit: int,
     compact: bool,
+    hybrid_search: bool,
     semantic_model: str,
-    model_cache: Path,
-    index_path: Path,
-    allow_model_download: bool,
     semantic_min_score: float,
     keyword_weight: float,
     semantic_weight: float,
@@ -1071,6 +1352,13 @@ def run_batch_search(
         request.setdefault("semantic_min_score", semantic_min_score)
         request.setdefault("keyword_weight", keyword_weight)
         request.setdefault("semantic_weight", semantic_weight)
+
+    if not hybrid_search:
+        notes, _ = scan_vault(vault_path)
+        print(json.dumps({
+            "results": [keyword_only_result(notes, request, semantic_model) for request in requests]
+        }, ensure_ascii=False, indent=2))
+        return 0
 
     if request_dir is not None:
         result = request_evidence_file_service(
@@ -1087,16 +1375,11 @@ def run_batch_search(
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
-    service = EmbeddingIndexService(
-        vault_path,
-        semantic_model,
-        model_cache,
-        index_path,
-        allow_model_download,
-    )
+    service = EmbeddingIndexService(vault_path, semantic_model)
+    results = service.search_requests(requests)
     print(
         json.dumps(
-            {"results": service.search_requests(requests)},
+            {"results": results, "embedding_usage": service.model.usage},
             ensure_ascii=False,
             indent=2,
         )
@@ -1109,10 +1392,8 @@ def run_search(
     requirement: str,
     terms: list[str],
     limit: int,
-    semantic_mode: str,
+    hybrid_search: bool,
     semantic_model: str,
-    model_cache: Path,
-    allow_model_download: bool,
     semantic_min_score: float,
     keyword_weight: float,
     semantic_weight: float,
@@ -1120,7 +1401,7 @@ def run_search(
     socket_path: Path | None,
     request_dir: Path | None,
 ) -> int:
-    if semantic_mode != "off" and request_dir is not None:
+    if hybrid_search and request_dir is not None:
         result = request_evidence_file_service(
             request_dir,
             {
@@ -1136,7 +1417,7 @@ def run_search(
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
-    if semantic_mode != "off" and socket_path is not None:
+    if hybrid_search and socket_path is not None:
         result = request_evidence_service(
             socket_path,
             {
@@ -1153,45 +1434,24 @@ def run_search(
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
-    notes, _ = scan_vault(vault_path)
-    semantic_scorer: Callable[[str, Sequence[EvidenceCandidate]], Sequence[float]] | None
-    if semantic_mode == "off":
-        semantic_scorer = lambda _requirement, candidates: [0.0] * len(candidates)
-        semantic_min_score = 1.0
-        semantic_weight = 0.0
-        keyword_weight = 1.0
+    if hybrid_search:
+        service = EmbeddingIndexService(vault_path, semantic_model)
+        result = service.search_request({
+            "requirement": requirement,
+            "terms": terms,
+            "limit": limit,
+            "compact": compact,
+            "semantic_min_score": semantic_min_score,
+            "keyword_weight": keyword_weight,
+            "semantic_weight": semantic_weight,
+        })
     else:
-        semantic_scorer = lambda query, candidates: local_semantic_scores(
-            query,
-            candidates,
-            model_name=semantic_model,
-            model_cache=model_cache,
-            allow_model_download=allow_model_download,
+        notes, _ = scan_vault(vault_path)
+        result = keyword_only_result(
+            notes,
+            {"requirement": requirement, "terms": terms, "limit": limit, "compact": compact},
+            semantic_model,
         )
-
-    matches = search_notes(
-        notes,
-        requirement,
-        terms,
-        limit,
-        semantic_scorer=semantic_scorer,
-        semantic_min_score=semantic_min_score,
-        keyword_weight=keyword_weight,
-        semantic_weight=semantic_weight,
-    )
-    if compact:
-        matches = compact_matches(matches)
-    result = result_payload(
-        requirement,
-        terms,
-        matches,
-        semantic_mode,
-        semantic_model,
-        model_cache,
-        semantic_min_score,
-        keyword_weight,
-        semantic_weight,
-    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
@@ -1203,17 +1463,31 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     check_parser = subparsers.add_parser("check", help="validate vault readiness")
     check_parser.add_argument("--vault", type=Path, default=default_vault_path())
 
+    index_check_parser = subparsers.add_parser(
+        "check-index",
+        help="verify that Chroma Cloud matches the current eligible vault",
+    )
+    index_check_parser.add_argument("--vault", type=Path, default=default_vault_path())
+    index_check_parser.add_argument(
+        "--embedding-model", "--semantic-model",
+        dest="embedding_model",
+        default=default_embedding_model(),
+        help="OpenAI embedding model used by the Chroma index",
+    )
+
     serve_parser = subparsers.add_parser(
         "serve",
-        help="load the local model once and serve cached vault searches",
+        help="keep one OpenAI embedding client warm and serve Chroma Cloud searches",
     )
     serve_parser.add_argument("--vault", type=Path, default=default_vault_path())
     serve_parser.add_argument("--socket", type=Path, default=default_evidence_socket_path())
     serve_parser.add_argument("--request-dir", type=Path, default=None)
-    serve_parser.add_argument("--semantic-model", default=DEFAULT_SEMANTIC_MODEL)
-    serve_parser.add_argument("--model-cache", type=Path, default=default_model_cache_path())
-    serve_parser.add_argument("--index-path", type=Path, default=default_embedding_index_path())
-    serve_parser.add_argument("--allow-model-download", action="store_true")
+    serve_parser.add_argument(
+        "--embedding-model", "--semantic-model",
+        dest="embedding_model",
+        default=default_embedding_model(),
+        help="OpenAI embedding model used for search queries",
+    )
     serve_parser.add_argument(
         "--pid-file",
         type=Path,
@@ -1236,6 +1510,13 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
     search_parser.add_argument("--limit", type=int, default=8)
     search_parser.add_argument(
+        "--hybrid-search",
+        type=parse_bool,
+        default=None,
+        metavar="true|false",
+        help="override config/search_targets.yaml; false uses keyword retrieval only",
+    )
+    search_parser.add_argument(
         "--compact",
         action="store_true",
         help="return top matches with short excerpts instead of full evidence text",
@@ -1257,24 +1538,14 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     search_parser.add_argument(
         "--semantic-mode",
         choices=("required", "off"),
-        default="required",
-        help="use local embeddings (default); 'off' is only for lexical diagnostics",
+        default=None,
+        help="legacy alias: 'off' selects keyword-only retrieval",
     )
     search_parser.add_argument(
-        "--semantic-model",
-        default=DEFAULT_SEMANTIC_MODEL,
-        help="local BERT-compatible embedding model name or path",
-    )
-    search_parser.add_argument(
-        "--allow-model-download",
-        action="store_true",
-        help="allow first-run download of the model; vault text remains local",
-    )
-    search_parser.add_argument(
-        "--model-cache",
-        type=Path,
-        default=default_model_cache_path(),
-        help="workspace-local directory containing the embedding model",
+        "--embedding-model", "--semantic-model",
+        dest="embedding_model",
+        default=default_embedding_model(),
+        help="OpenAI embedding model used for query and vault section text",
     )
     search_parser.add_argument(
         "--semantic-min-score",
@@ -1292,7 +1563,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--semantic-weight",
         type=float,
         default=DEFAULT_SEMANTIC_WEIGHT,
-        help="hybrid score weight for local semantic similarity",
+        help="hybrid score weight for Chroma Cloud similarity",
     )
 
     batch_parser = subparsers.add_parser(
@@ -1308,6 +1579,13 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     batch_parser.add_argument("--limit", type=int, default=3)
     batch_parser.add_argument("--compact", action="store_true")
     batch_parser.add_argument(
+        "--hybrid-search",
+        type=parse_bool,
+        default=None,
+        metavar="true|false",
+        help="override config/search_targets.yaml; false uses keyword retrieval only",
+    )
+    batch_parser.add_argument(
         "--socket",
         type=Path,
         default=(Path(os.environ["VAULT_EVIDENCE_SOCKET"])
@@ -1320,29 +1598,33 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
                  if os.environ.get("VAULT_EVIDENCE_REQUEST_DIR") else None),
     )
     batch_parser.add_argument("--vault", type=Path, default=default_vault_path())
-    batch_parser.add_argument("--semantic-model", default=DEFAULT_SEMANTIC_MODEL)
-    batch_parser.add_argument("--model-cache", type=Path, default=default_model_cache_path())
-    batch_parser.add_argument("--index-path", type=Path, default=default_embedding_index_path())
-    batch_parser.add_argument("--allow-model-download", action="store_true")
+    batch_parser.add_argument(
+        "--embedding-model", "--semantic-model",
+        dest="embedding_model",
+        default=default_embedding_model(),
+        help="OpenAI embedding model used for query and vault section text",
+    )
     batch_parser.add_argument("--semantic-min-score", type=float, default=DEFAULT_SEMANTIC_MIN_SCORE)
     batch_parser.add_argument("--keyword-weight", type=float, default=DEFAULT_KEYWORD_WEIGHT)
     batch_parser.add_argument("--semantic-weight", type=float, default=DEFAULT_SEMANTIC_WEIGHT)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.command in {"search", "batch-search"} and args.hybrid_search is None:
+        args.hybrid_search = default_hybrid_search()
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_arguments(argv)
     if args.command == "check":
         return run_check(args.vault)
+    if args.command == "check-index":
+        return run_check_index(args.vault, args.embedding_model)
     if args.command == "serve":
         return run_serve(
             args.vault,
             args.socket,
             args.request_dir,
-            args.semantic_model,
-            args.model_cache,
-            args.index_path,
-            args.allow_model_download,
+            args.embedding_model,
             args.pid_file,
         )
     if args.command == "search":
@@ -1353,10 +1635,8 @@ def main(argv: list[str] | None = None) -> int:
             args.requirement,
             args.term,
             args.limit,
-            args.semantic_mode,
-            args.semantic_model,
-            args.model_cache,
-            args.allow_model_download,
+            args.hybrid_search if args.semantic_mode is None else args.semantic_mode != "off",
+            args.embedding_model,
             args.semantic_min_score,
             args.keyword_weight,
             args.semantic_weight,
@@ -1372,10 +1652,8 @@ def main(argv: list[str] | None = None) -> int:
             args.input,
             args.limit,
             args.compact,
-            args.semantic_model,
-            args.model_cache,
-            args.index_path,
-            args.allow_model_download,
+            args.hybrid_search,
+            args.embedding_model,
             args.semantic_min_score,
             args.keyword_weight,
             args.semantic_weight,
@@ -1388,6 +1666,6 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, ValueError, SemanticSearchUnavailable, json.JSONDecodeError) as error:
         print(f"vault_evidence: {error}", file=sys.stderr)
         raise SystemExit(1) from error

@@ -1,2 +1,3 @@
-PyYAML>=6.0
+# Optional separate ATS/government source verification.
+-r requirements.txt
 playwright>=1.52,<2

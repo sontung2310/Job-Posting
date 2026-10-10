@@ -1,6 +1,8 @@
 timezone: "Australia/Melbourne"
 lookback_hours: 24
+discovery_supervision_minutes: 30
 ats_threshold_exclusive: 75
+hybrid_search: true
 max_results_per_search_per_source: 100
 
 sources:
@@ -9,27 +11,17 @@ sources:
     tool: "Indeed plugin"
   linkedin:
     enabled: true
-    actor: "curious_coder/linkedin-jobs-scraper"
+    actor: "valig/linkedin-jobs-scraper"
   seek:
     enabled: true
     actor: "websift/seek-job-scraper"
 
 searches:
   - title: "AI Engineer"
-    location: "Melbourne"
-  - title: "Junior AI Engineer"
-    location: "Melbourne"
-  - title: "AI Engineer"
-    location: "Sydney"
-  - title: "Junior AI Engineer"
-    location: "Sydney"
-  - title: "AI Engineer"
-    location: "Perth"
-  - title: "AI Engineer"
-    location: "Adelaide"
+    location: ["Melbourne", "Sydney", "Perth", "Adelaide", "Brisbane", "Canberra"]
   - title: "Computer Vision Engineer"
-    location: "Melbourne"
-  - title: "Computer Vision Engineer"
-    location: "Sydney"
-  - title: "Computer Vision Engineer"
-    location: "Perth"
+    location: ["Melbourne", "Sydney", "Perth", "Adelaide", "Brisbane", "Canberra"]
+  - title: "Machine Learning Engineer"
+    location: ["Melbourne", "Sydney", "Perth", "Adelaide", "Brisbane", "Canberra"]
+  - title: "Software Engineer"
+    location: ["Melbourne", "Sydney", "Perth", "Adelaide", "Brisbane", "Canberra"]

@@ -2,7 +2,7 @@
 
 ## 1. Vault retrieval and validation
 
-- [x] 1.1 Replace the reviewed terminology map with local semantic retrieval and verify its model dependency is declared separately from vault data.
+- [x] 1.1 Replace the reviewed terminology map with OpenAI semantic retrieval and Chroma Cloud indexing; declare the embedding API dependency separately.
 - [x] 1.2 Implement `scripts/vault_evidence.py check` to parse the supported Markdown frontmatter, reject ineligible notes, and verify failing prerequisites produce a non-zero exit and named reasons.
 - [x] 1.3 Implement `scripts/vault_evidence.py search` to return ranked, traceable eligible note sections using literal and semantic signals; verify keyword, semantic-only, hybrid, and no-match fixture queries return the expected JSON candidates.
 - [x] 1.4 Add unit fixtures and tests for frontmatter validation, section extraction, source/verification filtering, literal, semantic, and hybrid ranking, plus privacy-safe output; verify with `python3 -m unittest`.

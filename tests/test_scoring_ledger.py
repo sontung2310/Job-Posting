@@ -100,13 +100,13 @@ class ScoringLedgerTests(unittest.TestCase):
         self.assertEqual([record["record_type"] for record in records], ["batch_summary", "jd_score", "jd_score"])
         batch = records[0]
         self.assertEqual(batch["scored_jd_count"], 2)
-        self.assertEqual(batch["estimated_token_cost_usd"], 0.00308)
+        self.assertEqual(batch["estimated_token_cost_usd"], 0.00248)
         self.assertEqual(batch["token_usage"]["uncached_input_tokens"], 600)
-        self.assertEqual(batch["token_usage"]["billable_output_tokens"], 150)
+        self.assertEqual(batch["token_usage"]["billable_output_tokens"], 100)
         for record in records[1:]:
             estimate = record["batch_estimate"]
             self.assertEqual(estimate["estimated_time_seconds"], 60.0)
-            self.assertEqual(estimate["estimated_token_cost_usd"], 0.00154)
+            self.assertEqual(estimate["estimated_token_cost_usd"], 0.00124)
             self.assertEqual(estimate["estimated_token_usage"]["input_tokens"], 500.0)
             self.assertEqual(
                 estimate["allocation_method"],
@@ -128,6 +128,40 @@ class ScoringLedgerTests(unittest.TestCase):
         self.assertEqual(records[0]["record_type"], "batch_summary")
         self.assertEqual(records[0]["scored_jd_count"], 0)
         self.assertFalse(scoring_ledger.run_state_path(self.state_dir, run_id).exists())
+
+    def test_reasoning_tokens_are_included_in_output_tokens(self) -> None:
+        rates = {
+            "input_usd_per_million_tokens": 2.0,
+            "cached_input_usd_per_million_tokens": 0.2,
+            "output_usd_per_million_tokens": 12.0,
+        }
+        usage = {
+            "input_tokens": 1000,
+            "cached_input_tokens": 400,
+            "output_tokens": 100,
+            "reasoning_output_tokens": 50,
+        }
+        cost, uncached, output = scoring_ledger.estimate_cost(usage, rates)
+        self.assertEqual((cost, uncached, output), (0.00248, 600, 100))
+        usage["reasoning_output_tokens"] = 101
+        with self.assertRaisesRegex(ValueError, "cannot exceed"):
+            scoring_ledger.estimate_cost(usage, rates)
+
+    def test_condition_failure_cannot_be_recorded_as_a_scored_jd(self) -> None:
+        run_id = "2026-09-27-condition-failure"
+        scoring_ledger.run_begin(self.state_dir, run_id)
+
+        with self.assertRaisesRegex(ValueError, "status must be qualified or below_threshold"):
+            scoring_ledger.run_record(
+                self.state_dir,
+                run_id,
+                "https://jobs.example.test/required-pr",
+                "Example Co",
+                "AI Engineer",
+                90,
+                "ineligible",
+                "An eligibility condition failed.",
+            )
 
     def test_qualified_jd_without_suggestion_blocks_daily_finalization(self) -> None:
         run_id = "2026-09-27-missing-suggestion"
@@ -222,7 +256,7 @@ class ScoringLedgerTests(unittest.TestCase):
         self.assertEqual(len(daily_file.read_text(encoding="utf-8").splitlines()), 2)
         suggestion = json.loads(suggestion_path.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(suggestion["token_usage"]["input_tokens"], 100.0)
-        self.assertEqual(suggestion["cost_estimate_usd"], 0.000344)
+        self.assertEqual(suggestion["cost_estimate_usd"], 0.000284)
         self.assertEqual(suggestion["elapsed_seconds"], 120.0)
         self.assertTrue(suggestion["usage_available"])
         self.assertEqual(suggestion["usage_source"], "turn.completed")

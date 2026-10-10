@@ -1,3 +1,6 @@
+> Historical proposal: conflicting budgets and broad skill gates are superseded
+> by `../codex-led-job-search/`.
+
 # Proposal
 
 ## Why
@@ -38,10 +41,11 @@ current résumé makes that fit visible.
 
 - Affected runtime: job-search preflight, daily-run prompt, and the scoring
   workflow instructions.
-- New local tooling: a hybrid Python vault retrieval utility with literal keyword
-  search and local semantic embeddings.
+- Retrieval sends eligible section text and JD requirements to OpenAI for
+  embeddings, then stores eligible-section vectors, citation metadata, and an
+  eligible-input fingerprint in Chroma Cloud.
 - Approved application records use the private Obsidian workspace: Candidate
   Evidence Fit, résumé coverage, and separate strengths, gaps, and suggested CV
   changes live in frontmatter and the source-linked body.
-- No external tracker, Obsidian plugin, external retrieval service, or résumé
-  mutation is added.
+- Chroma Cloud stores vectors and metadata without source text; no external job
+  tracker, Obsidian plugin, or résumé mutation is added.
